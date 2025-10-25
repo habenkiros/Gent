@@ -6,7 +6,6 @@ import geopandas as gpd
 import matplotlib.pyplot as plt
 from io import BytesIO
 from PIL import Image
-from shapely.geometry import shape
 
 # ---------------------------------------------------
 # ✅ Fix for Streamlit Cloud CSS preload bug
@@ -25,31 +24,44 @@ COUNTRY_API = "https://restcountries.com/v3.1/all"
 GEOJSON_API = "https://raw.githubusercontent.com/datasets/geo-countries/master/data/countries.geojson"
 
 # ---------------------------------------------------
-# Fetch Data from APIs (cached)
+# Fetch Data (with fallback and retries)
 # ---------------------------------------------------
 @st.cache_data
 def get_countries():
-    """Fetch all countries and flags."""
+    """Fetch countries list with flags; fallback to static list if API fails."""
     try:
-        countries = requests.get(COUNTRY_API).json()
+        res = requests.get(COUNTRY_API, timeout=10)
+        res.raise_for_status()
+        data = res.json()
         result = []
-        for c in countries:
-            if "name" in c and "cca3" in c:
+        for c in data:
+            if "name" in c and "cca3" in c and "flags" in c:
                 result.append({
                     "name": c["name"]["common"],
                     "code": c["cca3"],
                     "flag": c["flags"]["png"],
                 })
-        return result
+        if result:
+            return result
+        else:
+            st.warning("API returned no valid country data. Using fallback list.")
     except Exception as e:
-        st.error(f"Error fetching countries: {e}")
-        return []
+        st.warning(f"⚠️ Could not fetch countries from API: {e}")
+
+    # Fallback minimal dataset
+    return [
+        {"name": "France", "code": "FRA", "flag": "https://flagcdn.com/w320/fr.png"},
+        {"name": "Brazil", "code": "BRA", "flag": "https://flagcdn.com/w320/br.png"},
+        {"name": "Japan", "code": "JPN", "flag": "https://flagcdn.com/w320/jp.png"},
+        {"name": "Ethiopia", "code": "ETH", "flag": "https://flagcdn.com/w320/et.png"},
+        {"name": "Canada", "code": "CAN", "flag": "https://flagcdn.com/w320/ca.png"},
+    ]
 
 @st.cache_data
 def get_world_geojson():
     """Load world shapes as GeoDataFrame."""
     try:
-        data = requests.get(GEOJSON_API).json()
+        data = requests.get(GEOJSON_API, timeout=10).json()
         return gpd.GeoDataFrame.from_features(data["features"])
     except Exception as e:
         st.error(f"Error fetching world map: {e}")
@@ -59,17 +71,14 @@ def get_world_geojson():
 # Utility functions
 # ---------------------------------------------------
 def get_country_shape(world_gdf, code):
-    """Return the GeoDataFrame of a specific country."""
     country = world_gdf[world_gdf["ISO_A3"] == code]
     return country if not country.empty else None
 
-
 def overlay_flag_on_shape(flag_url, country_shape):
-    """Overlay the country shape with its flag pattern."""
     try:
-        flag_img = Image.open(BytesIO(requests.get(flag_url).content)).convert("RGBA")
+        flag_img = Image.open(BytesIO(requests.get(flag_url, timeout=10).content)).convert("RGBA")
 
-        # Plot country shape to create a mask
+        # Create a country mask
         fig, ax = plt.subplots(figsize=(6, 4))
         country_shape.plot(ax=ax, color="white", edgecolor="black")
         ax.axis("off")
@@ -80,14 +89,14 @@ def overlay_flag_on_shape(flag_url, country_shape):
         buf.seek(0)
         mask = Image.open(buf).convert("L")
 
-        # Resize flag to match the mask
+        # Resize flag to match mask
         flag_img = flag_img.resize(mask.size)
 
-        # Composite the flag only where the mask is white
+        # Overlay flag within country boundaries
         result = Image.composite(flag_img, Image.new("RGBA", flag_img.size, (0, 0, 0, 0)), mask)
         return result
     except Exception as e:
-        st.error(f"Error generating flag map: {e}")
+        st.error(f"Error creating flag overlay: {e}")
         return None
 
 # ---------------------------------------------------
@@ -95,6 +104,10 @@ def overlay_flag_on_shape(flag_url, country_shape):
 # ---------------------------------------------------
 countries = get_countries()
 world = get_world_geojson()
+
+if not countries:
+    st.error("❌ Could not load any country data. Please refresh the page.")
+    st.stop()
 
 if "country" not in st.session_state:
     st.session_state.country = random.choice(countries)
@@ -104,28 +117,26 @@ if "country" not in st.session_state:
 country = st.session_state.country
 
 # ---------------------------------------------------
-# App UI
+# UI
 # ---------------------------------------------------
 st.title("🌍 Guess the Country Game (API Edition)")
-st.caption("Flag + Map overlay powered by REST APIs")
+st.caption("Flag painted on the map — powered by live APIs")
 
-# Get the country shape and render the flag map
 country_shape = get_country_shape(world, country["code"])
 if country_shape is not None:
     painted_map = overlay_flag_on_shape(country["flag"], country_shape)
     if painted_map:
         st.image(painted_map, caption="Which country is this?", use_container_width=True)
     else:
-        st.warning("Could not render flag overlay for this country.")
+        st.warning("Could not render the flag overlay.")
 else:
-    st.warning("Country shape not found in the GeoJSON dataset.")
+    st.warning("Country shape not found in map data.")
 
-# Input field for guess
+# ---------------------------------------------------
+# Game logic
+# ---------------------------------------------------
 guess = st.text_input("Enter your guess:").strip()
 
-# ---------------------------------------------------
-# Game Logic
-# ---------------------------------------------------
 if st.button("Submit Guess"):
     if guess.lower() == country["name"].lower():
         st.success(f"✅ Correct! It was {country['name']}.")
@@ -142,7 +153,7 @@ if st.button("Submit Guess"):
             st.warning(f"Wrong! Try again ({3 - st.session_state.tries} attempts left).")
 
 # ---------------------------------------------------
-# Score & Controls
+# Score + Controls
 # ---------------------------------------------------
 st.metric("Score", st.session_state.score)
 st.button("Next Country", on_click=lambda: st.session_state.update({
